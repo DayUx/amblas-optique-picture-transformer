@@ -42,11 +42,12 @@ def list_images_in_folder(folder: str) -> List[str]:
     return jpg_files
 
 
-def parse_rules_from_table(table: QTableWidget) -> List[Tuple[str, float]]:
-    rules: List[Tuple[str, float]] = []
+def parse_rules_from_table(table: QTableWidget) -> List[Tuple[str, float, bool]]:
+    rules: List[Tuple[str, float, bool]] = []
     for row in range(table.rowCount()):
         item_key = table.item(row, 0)
         item_percent = table.item(row, 1)
+        item_center = table.item(row, 2)
         key = (item_key.text().strip() if item_key else "")
         percent_str = (item_percent.text().strip() if item_percent else "")
         if not key:
@@ -64,7 +65,13 @@ def parse_rules_from_table(table: QTableWidget) -> List[Tuple[str, float]]:
         # Limite raisonnable: 0-100 (par côté)
         if val > 100:
             val = 100.0
-        rules.append((key, val / 100.0))
+        center_flag = True
+        if item_center is not None:
+            try:
+                center_flag = (item_center.checkState() == Qt.Checked)
+            except Exception:
+                center_flag = True
+        rules.append((key, val / 100.0, center_flag))
     return rules
 
 
@@ -77,7 +84,7 @@ class ImageProcessorWorker(QObject):
         self,
         input_dir: str,
         output_dir: str,
-        rules: List[Tuple[str, float]],
+        rules: List[Tuple[str, float, bool]],
         ignore_case: bool,
         bg_images: List[str],
     ):
@@ -88,24 +95,24 @@ class ImageProcessorWorker(QObject):
         self.ignore_case = ignore_case
         self.bg_images = bg_images
 
-    def _match_key(self, base_name: str) -> tuple[bool, float, str]:
+    def _match_key(self, base_name: str) -> tuple[bool, float, str, bool]:
         """
-        Retourne (matched, padding_ratio, matched_key)
+        Retourne (matched, padding_ratio, matched_key, center_flag)
         Le nom de fichier correspond s'il CONTIENT le mot-clé (et non plus s'il commence par).
         """
         name = base_name
         if self.ignore_case:
             name = name.lower()
 
-        for (key, ratio) in self.rules:
+        for (key, ratio, center_flag) in self.rules:
             k = key.lower() if self.ignore_case else key
             if k and k in name:
-                return True, ratio, key
-        return False, 0.0, ""
+                return True, ratio, key, center_flag
+        return False, 0.0, "", True
 
 
 
-    def _transform(self,path,padding_ratio):
+    def _transform(self, path, padding_ratio, center: bool = True):
 
 
 
@@ -161,7 +168,11 @@ class ImageProcessorWorker(QObject):
 
         # Place position
         center_x = pad + (usable_w - obj_new_w) // 2
-        center_y = int((bg_h - obj_new_h) / 2 + bg_h / 17)
+        if center:
+            center_y = int((bg_h - obj_new_h) / 2 + bg_h / 17)
+        else:
+            bottom_margin = int(bg_h / 20)
+            center_y = max(0, bg_h - obj_new_h)
 
         # Start composite
         bg_img = bg_img.astype(np.float32)
@@ -198,19 +209,20 @@ class ImageProcessorWorker(QObject):
         shadow_top = int(center_y + scaled_bbox_h - ((shadow_height / 5) + shadow_height * (y_offset / fg_h)))
         shadow_left = pad + (usable_w - shadow_new_w) // 2
 
-        # Place shadow
-        shadow_full_mask = np.zeros((bg_h, bg_w), dtype=np.uint8)
-        if 0 <= shadow_top < bg_h - shadow_height:
-            shadow_full_mask[shadow_top:shadow_top + shadow_height,
-            shadow_left:shadow_left + shadow_new_w] = shadow_mask_resized
+        if center :
+            # Place shadow
+            shadow_full_mask = np.zeros((bg_h, bg_w), dtype=np.uint8)
+            if 0 <= shadow_top < bg_h - shadow_height:
+                shadow_full_mask[shadow_top:shadow_top + shadow_height,
+                shadow_left:shadow_left + shadow_new_w] = shadow_mask_resized
 
-        # Blend shadow on background
-        shadow_alpha = shadow_full_mask.astype(np.float32) / 255.0
-        shadow_alpha_3ch = cv2.cvtColor(shadow_alpha, cv2.COLOR_GRAY2BGR)
-        shadow_color = (0, 0, 0)
-        shadow_opacity = 0.4
-        shadow_layer = np.full_like(bg_img, shadow_color, dtype=np.float32)
-        bg_img = bg_img * (1 - shadow_alpha_3ch * shadow_opacity) + shadow_layer * shadow_alpha_3ch * shadow_opacity
+            # Blend shadow on background
+            shadow_alpha = shadow_full_mask.astype(np.float32) / 255.0
+            shadow_alpha_3ch = cv2.cvtColor(shadow_alpha, cv2.COLOR_GRAY2BGR)
+            shadow_color = (0, 0, 0)
+            shadow_opacity = 0.4
+            shadow_layer = np.full_like(bg_img, shadow_color, dtype=np.float32)
+            bg_img = bg_img * (1 - shadow_alpha_3ch * shadow_opacity) + shadow_layer * shadow_alpha_3ch * shadow_opacity
 
         # Blend foreground again
         bg_roi = bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w]
@@ -219,16 +231,17 @@ class ImageProcessorWorker(QObject):
                 bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] * (1 - alpha_3) +
                 fg_float[:, :, :3] * alpha_3
         )
-        # Darken under shadow
-        shadow_fg = shadow_alpha[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] * 0.25
-        darken_mask = (shadow_fg * alpha).astype(np.float32)
-        darken_mask_3ch = cv2.cvtColor(darken_mask, cv2.COLOR_GRAY2BGR)
-        darkness_strength = 0.8
-        fg_rgb = fg_float[:, :, :3]
-        fg_rgb_darkened = fg_rgb * (1 - darken_mask_3ch * darkness_strength)
-        fg_float[:, :, :3] = fg_rgb_darkened
-        fg_over_bg = bg_roi * (1 - alpha_3) + fg_float[:, :, :3] * alpha_3
-        bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] = fg_over_bg
+        if center :
+            # Darken under shadow
+            shadow_fg = shadow_alpha[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] * 0.25
+            darken_mask = (shadow_fg * alpha).astype(np.float32)
+            darken_mask_3ch = cv2.cvtColor(darken_mask, cv2.COLOR_GRAY2BGR)
+            darkness_strength = 0.8
+            fg_rgb = fg_float[:, :, :3]
+            fg_rgb_darkened = fg_rgb * (1 - darken_mask_3ch * darkness_strength)
+            fg_float[:, :, :3] = fg_rgb_darkened
+            fg_over_bg = bg_roi * (1 - alpha_3) + fg_float[:, :, :3] * alpha_3
+            bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] = fg_over_bg
 
         final_img = bg_img.astype(np.uint8)
 
@@ -271,7 +284,7 @@ class ImageProcessorWorker(QObject):
                 self.progress.emit(idx, total)
                 base = os.path.basename(in_path)
                 stem, ext = os.path.splitext(base)
-                matched, ratio, matched_key = self._match_key(stem)
+                matched, ratio, matched_key, center_flag = self._match_key(stem)
                 if not matched:
                     skipped += 1
                     self.message.emit(f"Ignorée (pas de mot-clé) : {base}")
@@ -295,11 +308,11 @@ class ImageProcessorWorker(QObject):
                     #         save_kwargs.update({"quality": 95, "subsampling": 1})
                     #     canvas.save(out_path, **save_kwargs)
 
-                    self._transform(in_path,ratio)
+                    self._transform(in_path, ratio, center_flag)
 
                     processed += 1
                     self.message.emit(
-                        f"OK [{matched_key} {int(ratio*100)}%] → {base}"
+                        f"OK [{matched_key} {int(ratio*100)}% - {'center' if center_flag else 'bottom'}] → {base}"
                     )
                 except Exception as e:
                     self.message.emit(f"Erreur sur {base}: {e}")
@@ -373,12 +386,13 @@ class MainWindow(QWidget):
         opts_row.addItem(QSpacerItem(20, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
         root.addLayout(opts_row)
 
-        # Table des règles: Mot-clé / Padding (%)
+        # Table des règles: Mot-clé / Padding (%) / Centrer
         root.addWidget(QLabel("Règles de padding par mot-clé:"))
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Mot-clé", "Padding (%)"])
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Mot-clé", "Padding (%)", "Centrer"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         root.addWidget(self.table)
@@ -414,8 +428,12 @@ class MainWindow(QWidget):
         self._add_rule_row("FRONT", "10")
         self._add_rule_row("CAT", "15")
         self._add_rule_row("SIDE", "15")
+        self._add_rule_row("ZOOM", "0",False)
+        self._add_rule_row("GUY", "15",False)
+        self._add_rule_row("GUYS", "15",False)
+        self._add_rule_row("PEOPLE", "15",False)
 
-    def _add_rule_row(self, key: str = "", percent: str = ""):
+    def _add_rule_row(self, key: str = "", percent: str = "", center: bool = True):
         r = self.table.rowCount()
         self.table.insertRow(r)
         item_pfx = QTableWidgetItem(key)
@@ -425,6 +443,11 @@ class MainWindow(QWidget):
         item_pct.setFlags(item_pct.flags() | Qt.ItemIsEditable)
         self.table.setItem(r, 0, item_pfx)
         self.table.setItem(r, 1, item_pct)
+        # Colonne Centrer (checkbox)
+        item_center = QTableWidgetItem()
+        item_center.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        item_center.setCheckState(Qt.Checked if center else Qt.Unchecked)
+        self.table.setItem(r, 2, item_center)
 
     def _delete_selected_rows(self):
         selected = sorted(set(idx.row() for idx in self.table.selectedIndexes()), reverse=True)
