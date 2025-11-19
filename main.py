@@ -36,7 +36,7 @@ def list_images_in_folder(folder: str) -> List[str]:
     jpg_files = []
     for dirpath, _, filenames in os.walk(folder):
         for filename in filenames:
-            if filename.lower().endswith(".jpg"):
+            if filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg") or filename.lower().endswith(".png") or filename.lower().endswith(".bmp") or filename.lower().endswith(".tif") or filename.lower().endswith(".tiff") or filename.lower().endswith(".webp"):
                 full_path = os.path.join(dirpath, filename)
                 jpg_files.append(full_path)
     return jpg_files
