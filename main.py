@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 from typing import List, Tuple
@@ -426,6 +428,7 @@ class MainWindow(QWidget):
 
         # Ligne initiale d’exemple
         self._add_rule_row("FRONT", "10")
+        self._add_rule_row("BACK", "10")
         self._add_rule_row("CAT", "15")
         self._add_rule_row("SIDE", "15")
         self._add_rule_row("ZOOM", "0",False)
