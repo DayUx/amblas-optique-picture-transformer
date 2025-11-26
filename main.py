@@ -7,6 +7,12 @@ import cv2
 import numpy as np
 import random
 
+# Import AVIF plugin pour Pillow
+try:
+    import pillow_avif
+except ImportError:
+    pass
+
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtWidgets import (
     QApplication,
@@ -31,14 +37,40 @@ from PyQt5.QtWidgets import (
 from PIL import Image
 
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".avif"}
+
+def load_image(path: str) -> np.ndarray:
+    """
+    Load an image from path. Uses PIL for AVIF files, cv2 for others.
+    Returns image in BGR format (OpenCV standard).
+    """
+    ext = os.path.splitext(path)[1].lower()
+    
+    if ext == ".avif":
+        # Use PIL to load AVIF, then convert to OpenCV format
+        pil_img = Image.open(path)
+        # Convert to RGB if needed
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
+        # Convert PIL Image to numpy array (RGB)
+        img_rgb = np.array(pil_img)
+        # Convert RGB to BGR for OpenCV
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        return img_bgr
+    else:
+        # Use OpenCV for other formats
+        img = cv2.imread(path)
+        if img is None:
+            raise ValueError(f"Failed to load image: {path}")
+        return img
+
 
 
 def list_images_in_folder(folder: str) -> List[str]:
     jpg_files = []
     for dirpath, _, filenames in os.walk(folder):
         for filename in filenames:
-            if filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg") or filename.lower().endswith(".png") or filename.lower().endswith(".bmp") or filename.lower().endswith(".tif") or filename.lower().endswith(".tiff") or filename.lower().endswith(".webp"):
+            if filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg") or filename.lower().endswith(".png") or filename.lower().endswith(".bmp") or filename.lower().endswith(".tif") or filename.lower().endswith(".tiff") or filename.lower().endswith(".webp") or filename.lower().endswith(".avif"):
                 full_path = os.path.join(dirpath, filename)
                 jpg_files.append(full_path)
     return jpg_files
@@ -123,7 +155,7 @@ class ImageProcessorWorker(QObject):
 
     def _transform(self, path, padding_ratio, center: bool = True, no_shadow: bool = False):
         # load image
-        img = cv2.imread(path)
+        img = load_image(path)
 
         # convert to gray
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -468,7 +500,7 @@ class MainWindow(QWidget):
             self,
             "Choisir un ou plusieurs fonds",
             "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.avif)",
         )
         if files:
             self.background_paths = files
