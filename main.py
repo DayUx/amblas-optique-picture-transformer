@@ -39,30 +39,43 @@ from PIL import Image
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".avif"}
 
-def load_image(path: str) -> np.ndarray:
+def load_image(path: str) -> tuple[np.ndarray, bool]:
     """
     Load an image from path. Uses PIL for AVIF files, cv2 for others.
-    Returns image in BGR format (OpenCV standard).
+    Returns tuple: (image in BGRA format, has_transparency)
     """
     ext = os.path.splitext(path)[1].lower()
     
     if ext == ".avif":
         # Use PIL to load AVIF, then convert to OpenCV format
         pil_img = Image.open(path)
-        # Convert to RGB if needed
-        if pil_img.mode != 'RGB':
-            pil_img = pil_img.convert('RGB')
-        # Convert PIL Image to numpy array (RGB)
-        img_rgb = np.array(pil_img)
-        # Convert RGB to BGR for OpenCV
-        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-        return img_bgr
+        has_alpha = pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info)
+
+        # Convert to RGBA
+        if pil_img.mode != 'RGBA':
+            pil_img = pil_img.convert('RGBA')
+
+        # Convert PIL Image to numpy array (RGBA)
+        img_rgba = np.array(pil_img)
+        # Convert RGBA to BGRA for OpenCV
+        img_bgra = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGRA)
+        return img_bgra, has_alpha
     else:
-        # Use OpenCV for other formats
-        img = cv2.imread(path)
+        # Use OpenCV for other formats - load with alpha channel
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
             raise ValueError(f"Failed to load image: {path}")
-        return img
+
+        # Check if image has alpha channel
+        has_alpha = (len(img.shape) == 3 and img.shape[2] == 4)
+
+        # Convert to BGRA if needed
+        if not has_alpha:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+            # Set alpha to fully opaque
+            img[:, :, 3] = 255
+
+        return img, has_alpha
 
 
 
@@ -153,30 +166,42 @@ class ImageProcessorWorker(QObject):
                 return True, ratio, key, center_flag, no_shadow_flag
         return False, 0.0, "", True, False
 
-    def _transform(self, path, padding_ratio, center: bool = True, no_shadow: bool = False):
-        # load image
-        img = load_image(path)
+    def _transform(self, path, padding_ratio, center: bool = True, no_shadow: bool = False) -> bool:
+        """
+        Transform image and return True if image had transparency
+        """
+        # load image with transparency info
+        img, has_transparency = load_image(path)
 
-        # convert to gray
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if has_transparency:
+            # Image already has transparency - use existing alpha channel
+            result = img.copy()
+            mask = result[:, :, 3]
+            # Disable shadow for transparent images
+            no_shadow = True
+        else:
+            # No transparency - extract from white background
+            # convert to gray
+            gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
 
-        # threshold input image as mask
-        mask = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)[1]
-        mask = 255 - mask
+            # threshold input image as mask
+            mask = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)[1]
+            mask = 255 - mask
 
-        # clean up mask
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            # clean up mask
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        # anti-alias mask
-        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=2, sigmaY=2)
-        mask = (2 * mask.astype(np.float32) - 255).clip(0, 255).astype(np.uint8)
+            # anti-alias mask
+            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=2, sigmaY=2)
+            mask = (2 * mask.astype(np.float32) - 255).clip(0, 255).astype(np.uint8)
 
-        # put alpha into image
-        result = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+            # put alpha into image
+            result = img.copy()
+            result[:, :, 3] = mask
+
         fg_h, fg_w, _ = result.shape
-        result[:, :, 3] = mask
 
         bg_img = cv2.imread(random.choice(self.bg_images))
         bg_h, bg_w, _ = bg_img.shape
@@ -296,6 +321,8 @@ class ImageProcessorWorker(QObject):
 
         cv2.imwrite(output_file_path, final_img, [cv2.IMWRITE_WEBP_QUALITY, 95])
 
+        return has_transparency
+
     def run(self):
         try:
             if not os.path.isdir(self.input_dir):
@@ -343,11 +370,12 @@ class ImageProcessorWorker(QObject):
                     #         save_kwargs.update({"quality": 95, "subsampling": 1})
                     #     canvas.save(out_path, **save_kwargs)
 
-                    self._transform(in_path, ratio, center_flag, no_shadow_flag)
+                    had_transparency = self._transform(in_path, ratio, center_flag, no_shadow_flag)
 
                     processed += 1
+                    transparency_info = " [transparence détectée]" if had_transparency else ""
                     self.message.emit(
-                        f"OK [{matched_key} {int(ratio*100)}% - {'center' if center_flag else 'bottom'}] → {base}"
+                        f"OK [{matched_key} {int(ratio*100)}% - {'center' if center_flag else 'bottom'}]{transparency_info} → {base}"
                     )
                 except Exception as e:
                     self.message.emit(f"Erreur sur {base}: {e}")
