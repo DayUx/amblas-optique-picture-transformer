@@ -200,11 +200,6 @@ class ImageProcessorWorker(QObject):
             clean_rgba = np.array(pil_clean)
             clean_bgra = cv2.cvtColor(clean_rgba, cv2.COLOR_RGBA2BGRA)
 
-            base = os.path.basename(path)
-            name, _ = os.path.splitext(base)
-            out_path = os.path.join(self.output_dir, f"{name}-remove.jpg")
-            cv2.imwrite(out_path, clean_bgra, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
 
             # Trouver le bounding box de l'objet réel (sans ombre)
             clean_mask = clean_bgra[:, :, 3]
@@ -280,8 +275,8 @@ class ImageProcessorWorker(QObject):
                 # Sauvegarder
                 base = os.path.basename(path)
                 name, _ = os.path.splitext(base)
-                out_path = os.path.join(self.output_dir, f"{name}.jpg")
-                cv2.imwrite(out_path, output, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                out_path = os.path.join(self.output_dir, f"{name}.webp")
+                cv2.imwrite(out_path, output, [cv2.IMWRITE_WEBP_QUALITY, 95])
 
                 return True
             else:
@@ -432,8 +427,8 @@ class ImageProcessorWorker(QObject):
 
         base = os.path.basename(path)
         name, _ = os.path.splitext(base)
-        out_path = os.path.join(self.output_dir, f"{name}.jpg")
-        cv2.imwrite(out_path, output, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        out_path = os.path.join(self.output_dir, f"{name}.webp")
+        cv2.imwrite(out_path, output, [cv2.IMWRITE_WEBP_QUALITY, 95])
 
         return has_transparency
 
