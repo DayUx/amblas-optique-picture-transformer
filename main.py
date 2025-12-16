@@ -178,8 +178,115 @@ class ImageProcessorWorker(QObject):
         img, has_transparency = load_image(path)
 
         if has_transparency:
-            result = img.copy()
+            # Image a déjà de la transparence - utiliser rembg pour trouver les vrais bords
+            # mais garder l'image originale pour le rendu (avec ombre)
+            original_with_shadow = img.copy()
             no_shadow = True
+            # Utiliser rembg pour obtenir uniquement l'objet (sans ombre)
+            # D'abord placer l'image sur un fond blanc pour que rembg fonctionne correctement
+            img_rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+            alpha = img_rgba[:, :, 3:4].astype(np.float32) / 255.0
+
+            # Créer un fond blanc
+            white_bg = np.ones_like(img_rgba[:, :, :3], dtype=np.uint8) * 255
+
+            # Composer l'image sur le fond blanc
+            img_on_white = (img_rgba[:, :, :3].astype(np.float32) * alpha +
+                            white_bg.astype(np.float32) * (1 - alpha)).astype(np.uint8)
+
+            # Convertir en PIL pour rembg
+            pil_img = Image.fromarray(img_on_white)
+            pil_clean = remove(pil_img)
+            clean_rgba = np.array(pil_clean)
+            clean_bgra = cv2.cvtColor(clean_rgba, cv2.COLOR_RGBA2BGRA)
+
+            base = os.path.basename(path)
+            name, _ = os.path.splitext(base)
+            out_path = os.path.join(self.output_dir, f"{name}-remove.jpg")
+            cv2.imwrite(out_path, clean_bgra, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+
+            # Trouver le bounding box de l'objet réel (sans ombre)
+            clean_mask = clean_bgra[:, :, 3]
+            coords = cv2.findNonZero(clean_mask)
+
+            if coords is not None:
+                x, y, obj_w, obj_h = cv2.boundingRect(coords)
+
+                # Calculer le padding basé sur les dimensions de l'objet réel
+                pad_x = int(round(obj_w * padding_ratio))
+                pad_y = int(round(obj_h * padding_ratio))
+
+                # Charger le fond
+                bg_img = cv2.imread(random.choice(self.bg_images))
+                bg_h, bg_w = bg_img.shape[:2]
+
+                # Calculer l'échelle pour que l'objet + padding tienne dans le fond
+                needed_w = obj_w + 2 * pad_x
+                needed_h = obj_h + 2 * pad_y
+                scale = min(bg_w / needed_w, bg_h / needed_h)
+
+                # Redimensionner l'image originale (avec ombre)
+                fg_h, fg_w = original_with_shadow.shape[:2]
+                new_fg_w = int(fg_w * scale)
+                new_fg_h = int(fg_h * scale)
+
+                result_resized = cv2.resize(original_with_shadow, (new_fg_w, new_fg_h), interpolation=cv2.INTER_AREA)
+                mask_resized = cv2.resize(original_with_shadow[:, :, 3], (new_fg_w, new_fg_h),
+                                          interpolation=cv2.INTER_AREA)
+
+                # Calculer la nouvelle position de l'objet après redimensionnement
+                new_x = int(x * scale)
+                new_y = int(y * scale)
+                new_obj_w = int(obj_w * scale)
+                new_obj_h = int(obj_h * scale)
+                new_pad_x = int(pad_x * scale)
+                new_pad_y = int(pad_y * scale)
+
+                # Position pour centrer l'OBJET (pas l'image entière)
+                if center:
+                    # Centrer l'objet dans le fond
+                    obj_center_in_resized_x = new_x + new_obj_w // 2
+                    obj_center_in_resized_y = new_y + new_obj_h // 2
+
+                    x_offset = (bg_w // 2) - obj_center_in_resized_x
+                    y_offset = (bg_h // 2) - obj_center_in_resized_y
+                else:
+                    # Aligner le bas de l'objet avec le padding
+                    x_offset = (bg_w // 2) - (new_x + new_obj_w // 2)
+                    y_offset = bg_h - new_pad_y - (new_y + new_obj_h)
+
+                # Composer l'image
+                output = bg_img.copy()
+                mask_norm = mask_resized.astype(np.float32) / 255.0
+
+                # Calculer les limites pour éviter les débordements
+                y1_dst = max(0, y_offset)
+                y2_dst = min(bg_h, y_offset + new_fg_h)
+                x1_dst = max(0, x_offset)
+                x2_dst = min(bg_w, x_offset + new_fg_w)
+
+                y1_src = max(0, -y_offset)
+                y2_src = y1_src + (y2_dst - y1_dst)
+                x1_src = max(0, -x_offset)
+                x2_src = x1_src + (x2_dst - x1_dst)
+
+                for c in range(3):
+                    output[y1_dst:y2_dst, x1_dst:x2_dst, c] = (
+                            result_resized[y1_src:y2_src, x1_src:x2_src, c] * mask_norm[y1_src:y2_src, x1_src:x2_src] +
+                            output[y1_dst:y2_dst, x1_dst:x2_dst, c] * (1 - mask_norm[y1_src:y2_src, x1_src:x2_src])
+                    ).astype(np.uint8)
+
+                # Sauvegarder
+                base = os.path.basename(path)
+                name, _ = os.path.splitext(base)
+                out_path = os.path.join(self.output_dir, f"{name}.jpg")
+                cv2.imwrite(out_path, output, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+                return True
+            else:
+                # Pas d'objet détecté, utiliser l'image telle quelle
+                result = img.copy()
         elif self.use_rembg:
             # Méthode rembg (IA)
             img_rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
@@ -195,51 +302,134 @@ class ImageProcessorWorker(QObject):
             mask_inv = cv2.bitwise_not(mask)
             result[:, :, 3] = mask_inv
 
+        # Code existant pour les images sans transparence
         mask = result[:, :, 3]
         fg_h, fg_w = result.shape[:2]
 
-        # Charger le fond et utiliser SA dimension
+        # Trouver la bounding box de l'objet pour le calcul du padding
+        coords = cv2.findNonZero(mask)
+        if coords is not None:
+            bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(coords)
+        else:
+            bbox_x, bbox_y, bbox_w, bbox_h = 0, 0, fg_w, fg_h
+
         bg_img = cv2.imread(random.choice(self.bg_images))
         bg_h, bg_w = bg_img.shape[:2]
 
-        # Calculer l'échelle pour que l'image + padding tienne dans le fond
-        pad_x = int(round(fg_w * padding_ratio))
-        pad_y = int(round(fg_h * padding_ratio))
-        needed_w = fg_w + 2 * pad_x
-        needed_h = fg_h + 2 * pad_y
+        # Calculer le padding basé sur la bounding box, pas l'image entière
+        pad_x = int(round(bbox_w * padding_ratio))
+        pad_y = int(round(bbox_h * padding_ratio))
+        needed_w = bbox_w + 2 * pad_x
+        needed_h = bbox_h + 2 * pad_y
 
-        # Redimensionner le foreground pour qu'il tienne dans le fond
         scale = min(bg_w / needed_w, bg_h / needed_h)
         new_fg_w = int(fg_w * scale)
         new_fg_h = int(fg_h * scale)
         new_pad_x = int(pad_x * scale)
         new_pad_y = int(pad_y * scale)
 
+        # Calculer les nouvelles coordonnées de la bounding box après redimensionnement
+        new_bbox_x = int(bbox_x * scale)
+        new_bbox_y = int(bbox_y * scale)
+        new_bbox_w = int(bbox_w * scale)
+        new_bbox_h = int(bbox_h * scale)
+
         result_resized = cv2.resize(result, (new_fg_w, new_fg_h), interpolation=cv2.INTER_AREA)
         mask_resized = cv2.resize(mask, (new_fg_w, new_fg_h), interpolation=cv2.INTER_AREA)
 
-        # Position du foreground dans le fond
         if center:
-            x_offset = (bg_w - new_fg_w) // 2
-            y_offset = (bg_h - new_fg_h) // 2
+            # Centrer l'objet (bounding box) dans le fond
+            obj_center_x = new_bbox_x + new_bbox_w // 2
+            obj_center_y = new_bbox_y + new_bbox_h // 2
+            x_offset = (bg_w // 2) - obj_center_x
+            y_offset = (bg_h // 2) - obj_center_y
         else:
-            x_offset = (bg_w - new_fg_w) // 2
-            y_offset = bg_h - new_fg_h - new_pad_y
+            # Aligner le bas de l'objet avec le padding
+            x_offset = (bg_w // 2) - (new_bbox_x + new_bbox_w // 2)
+            y_offset = bg_h - new_pad_y - (new_bbox_y + new_bbox_h)
 
-        # Créer le masque normalisé
-        mask_norm = mask_resized.astype(np.float32) / 255.0
+        # Convertir en float pour le compositing
+        bg_img = bg_img.astype(np.float32)
+        fg_float = result_resized.astype(np.float32)
+        alpha = fg_float[:, :, 3] / 255.0
+        alpha_3 = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
 
-        # Copier le fond pour ne pas le modifier
-        output = bg_img.copy()
+        # === GÉNÉRATION DE L'OMBRE ORIGINALE ===
+        if not no_shadow and center:
+            # Trouver la bounding box de l'objet réel
+            coords = cv2.findNonZero(mask_resized)
+            if coords is not None:
+                obj_x, obj_y, obj_w, obj_h = cv2.boundingRect(coords)
 
-        # Composer l'image
-        for c in range(3):
-            output[y_offset:y_offset + new_fg_h, x_offset:x_offset + new_fg_w, c] = (
-                    result_resized[:, :, c] * mask_norm +
-                    output[y_offset:y_offset + new_fg_h, x_offset:x_offset + new_fg_w, c] * (1 - mask_norm)
-            ).astype(np.uint8)
+                shadow_mask = mask_resized.copy()
 
-        # Sauvegarder
+                # Éroder le masque pour réduire l'ombre
+                erode_size = max(1, int(new_fg_h / 5))
+                erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
+                shadow_mask = cv2.erode(shadow_mask, erode_kernel)
+
+                # Flou gaussien pour adoucir l'ombre
+                sigma = max(1, new_fg_h / 10)
+                shadow_mask = cv2.GaussianBlur(shadow_mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+                # Redimensionner l'ombre en bande horizontale
+                shadow_height = 50
+                shadow_new_w = obj_w  # Largeur basée sur l'objet, pas l'image
+                shadow_mask_cropped = shadow_mask[:, obj_x:obj_x + obj_w]  # Cropper sur la largeur de l'objet
+                shadow_mask_resized = cv2.resize(shadow_mask_cropped, (shadow_new_w, shadow_height))
+
+                # Position de l'ombre (sous la bounding box de l'objet)
+                shadow_top = y_offset + obj_y + obj_h - shadow_height // 2
+                shadow_left = x_offset + obj_x
+
+                # Créer le masque d'ombre pleine image
+                shadow_full_mask = np.zeros((bg_h, bg_w), dtype=np.uint8)
+
+                # Vérifier les limites
+                if 0 <= shadow_top < bg_h - shadow_height and shadow_top + shadow_height <= bg_h:
+                    y1 = shadow_top
+                    y2 = min(shadow_top + shadow_height, bg_h)
+                    x1 = max(0, shadow_left)
+                    x2 = min(shadow_left + shadow_new_w, bg_w)
+
+                    src_x1 = max(0, -shadow_left)
+                    src_x2 = src_x1 + (x2 - x1)
+                    src_y2 = y2 - y1
+
+                    if src_x2 <= shadow_new_w and src_y2 <= shadow_height:
+                        shadow_full_mask[y1:y2, x1:x2] = shadow_mask_resized[:src_y2, src_x1:src_x2]
+
+                # Appliquer l'ombre sur le fond
+                shadow_alpha = shadow_full_mask.astype(np.float32) / 255.0
+                shadow_alpha_3ch = cv2.cvtColor(shadow_alpha, cv2.COLOR_GRAY2BGR)
+                shadow_opacity = 0.4
+                shadow_layer = np.zeros_like(bg_img, dtype=np.float32)
+                bg_img = bg_img * (1 - shadow_alpha_3ch * shadow_opacity) + shadow_layer * shadow_alpha_3ch * shadow_opacity
+        # === FIN GÉNÉRATION DE L'OMBRE ===
+
+        # Composer le foreground sur le fond avec gestion des limites
+        y1_dst = max(0, y_offset)
+        y2_dst = min(bg_h, y_offset + new_fg_h)
+        x1_dst = max(0, x_offset)
+        x2_dst = min(bg_w, x_offset + new_fg_w)
+
+        y1_src = max(0, -y_offset)
+        y2_src = y1_src + (y2_dst - y1_dst)
+        x1_src = max(0, -x_offset)
+        x2_src = x1_src + (x2_dst - x1_dst)
+
+        # Vérifier que les dimensions sont cohérentes
+        if y2_dst > y1_dst and x2_dst > x1_dst:
+            roi = bg_img[y1_dst:y2_dst, x1_dst:x2_dst]
+            fg_crop = fg_float[y1_src:y2_src, x1_src:x2_src, :3]
+            alpha_crop = alpha_3[y1_src:y2_src, x1_src:x2_src]
+
+            blended = roi * (1 - alpha_crop) + fg_crop * alpha_crop
+            bg_img[y1_dst:y2_dst, x1_dst:x2_dst] = blended
+
+        # Convertir en uint8 pour la sauvegarde
+        output = bg_img.astype(np.uint8)
+
         base = os.path.basename(path)
         name, _ = os.path.splitext(base)
         out_path = os.path.join(self.output_dir, f"{name}.jpg")
