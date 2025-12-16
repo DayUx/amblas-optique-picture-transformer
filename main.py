@@ -6,6 +6,9 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 import random
+# Ajouter cet import en haut du fichier avec les autres imports
+from rembg import remove
+
 
 # Import AVIF plugin pour Pillow
 try:
@@ -143,6 +146,7 @@ class ImageProcessorWorker(QObject):
         rules: List[Tuple[str, float, bool, bool]],
         ignore_case: bool,
         bg_images: List[str],
+        use_rembg: bool = False,
     ):
         super().__init__()
         self.input_dir = input_dir
@@ -150,6 +154,7 @@ class ImageProcessorWorker(QObject):
         self.rules = rules
         self.ignore_case = ignore_case
         self.bg_images = bg_images
+        self.use_rembg = use_rembg
 
     def _match_key(self, base_name: str) -> tuple[bool, float, str, bool, bool]:
         """
@@ -170,156 +175,75 @@ class ImageProcessorWorker(QObject):
         """
         Transform image and return True if image had transparency
         """
-        # load image with transparency info
         img, has_transparency = load_image(path)
 
         if has_transparency:
-            # Image already has transparency - use existing alpha channel
             result = img.copy()
-            mask = result[:, :, 3]
-            # Disable shadow for transparent images
             no_shadow = True
+        elif self.use_rembg:
+            # Méthode rembg (IA)
+            img_rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+            pil_img = Image.fromarray(img_rgba)
+            pil_result = remove(pil_img)
+            result_rgba = np.array(pil_result)
+            result = cv2.cvtColor(result_rgba, cv2.COLOR_RGBA2BGRA)
         else:
-            # No transparency - extract from white background
-            # convert to gray
-            gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
-
-            # threshold input image as mask
-            mask = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)[1]
-            mask = 255 - mask
-
-            # clean up mask
-            kernel = np.ones((3, 3), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-            # anti-alias mask
-            mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=2, sigmaY=2)
-            mask = (2 * mask.astype(np.float32) - 255).clip(0, 255).astype(np.uint8)
-
-            # put alpha into image
+            # Méthode classique (seuil blanc)
             result = img.copy()
-            result[:, :, 3] = mask
+            gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+            _, mask = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)
+            mask_inv = cv2.bitwise_not(mask)
+            result[:, :, 3] = mask_inv
 
-        fg_h, fg_w, _ = result.shape
+        mask = result[:, :, 3]
+        fg_h, fg_w = result.shape[:2]
 
+        # Charger le fond et utiliser SA dimension
         bg_img = cv2.imread(random.choice(self.bg_images))
-        bg_h, bg_w, _ = bg_img.shape
+        bg_h, bg_w = bg_img.shape[:2]
 
-        # Resize full image to fit width
-        aspect_ratio = result.shape[1] / result.shape[0]
-        resized_w = bg_w
-        resized_h = int(resized_w / aspect_ratio)
-        result_resized = cv2.resize(result, (resized_w, resized_h))
+        # Calculer l'échelle pour que l'image + padding tienne dans le fond
+        pad_x = int(round(fg_w * padding_ratio))
+        pad_y = int(round(fg_h * padding_ratio))
+        needed_w = fg_w + 2 * pad_x
+        needed_h = fg_h + 2 * pad_y
 
-        # Bounding box from alpha
-        non_zero = cv2.findNonZero(result_resized[:, :, 3])
-        x, y, w, h = cv2.boundingRect(non_zero)
+        # Redimensionner le foreground pour qu'il tienne dans le fond
+        scale = min(bg_w / needed_w, bg_h / needed_h)
+        new_fg_w = int(fg_w * scale)
+        new_fg_h = int(fg_h * scale)
+        new_pad_x = int(pad_x * scale)
+        new_pad_y = int(pad_y * scale)
 
-        # Crop object from result_resized
-        object_crop = result_resized[y:y + h, x:x + w]
-        pad = int(bg_w * padding_ratio)
-        usable_w = bg_w - 2 * pad
-        obj_ar = w / h
-        obj_new_w = usable_w
-        obj_new_h = int(obj_new_w / obj_ar)
-        fg_resized = cv2.resize(object_crop, (obj_new_w, obj_new_h))
+        result_resized = cv2.resize(result, (new_fg_w, new_fg_h), interpolation=cv2.INTER_AREA)
+        mask_resized = cv2.resize(mask, (new_fg_w, new_fg_h), interpolation=cv2.INTER_AREA)
 
-        # Place position
-        center_x = pad + (usable_w - obj_new_w) // 2
+        # Position du foreground dans le fond
         if center:
-            center_y = int((bg_h - obj_new_h) / 2 + bg_h / 17)
+            x_offset = (bg_w - new_fg_w) // 2
+            y_offset = (bg_h - new_fg_h) // 2
         else:
-            bottom_margin = int(bg_h / 20)
-            center_y = max(0, bg_h - obj_new_h)
+            x_offset = (bg_w - new_fg_w) // 2
+            y_offset = bg_h - new_fg_h - new_pad_y
 
-        # Start composite
-        bg_img = bg_img.astype(np.float32)
-        roi = bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w].copy()
-        fg_float = fg_resized.astype(np.float32)
-        alpha = fg_float[:, :, 3] / 255.0
-        alpha_3 = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
-        blended_fg = roi * (1 - alpha_3) + fg_float[:, :, :3] * alpha_3
+        # Créer le masque normalisé
+        mask_norm = mask_resized.astype(np.float32) / 255.0
 
-        # Shadow generation from full image to avoid cutoff
-        if not no_shadow:
-            shadow_mask = result_resized[:, :, 3]
-            erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(resized_h / 5), int(resized_h / 5)))
-            shadow_mask = cv2.erode(shadow_mask, erode_kernel)
-            shadow_mask = cv2.GaussianBlur(shadow_mask, (0, 0), sigmaX=resized_h / 10, sigmaY=resized_h / 10)
+        # Copier le fond pour ne pas le modifier
+        output = bg_img.copy()
 
-            # Calculate scaled Y offset
-            scale_factor = obj_new_w / w
-            scaled_bbox_h = int(h * scale_factor)
-            y_offset = int((resized_h - h) / 2 * scale_factor)
-            w_offset = int((resized_w - w) / 2 * scale_factor)
+        # Composer l'image
+        for c in range(3):
+            output[y_offset:y_offset + new_fg_h, x_offset:x_offset + new_fg_w, c] = (
+                    result_resized[:, :, c] * mask_norm +
+                    output[y_offset:y_offset + new_fg_h, x_offset:x_offset + new_fg_w, c] * (1 - mask_norm)
+            ).astype(np.uint8)
 
-            shadow_new_w = bg_w - 2 * (pad - w_offset)
-
-            # Resize shadow width
-            shadow_height = 50
-            shadow_mask_resized = cv2.resize(shadow_mask, (shadow_new_w, shadow_height))
-
-            # Calculate Y offset between result_resized and fg_resized
-            fg_bbox_in_resized = [x, y, w, h]
-            scaled_bbox_w = obj_new_w
-            scale_factor = scaled_bbox_w / w
-            scaled_bbox_h = int(h * scale_factor)
-            y_offset = int((resized_h - h) / 2 * scale_factor)
-            shadow_top = int(center_y + scaled_bbox_h - ((shadow_height / 5) + shadow_height * (y_offset / fg_h)))
-            shadow_left = pad + (usable_w - shadow_new_w) // 2
-
-        if center and not no_shadow:
-            # Place shadow
-            shadow_full_mask = np.zeros((bg_h, bg_w), dtype=np.uint8)
-            if 0 <= shadow_top < bg_h - shadow_height:
-                shadow_full_mask[shadow_top:shadow_top + shadow_height,
-                shadow_left:shadow_left + shadow_new_w] = shadow_mask_resized
-
-            # Blend shadow on background
-            shadow_alpha = shadow_full_mask.astype(np.float32) / 255.0
-            shadow_alpha_3ch = cv2.cvtColor(shadow_alpha, cv2.COLOR_GRAY2BGR)
-            shadow_color = (0, 0, 0)
-            shadow_opacity = 0.4
-            shadow_layer = np.full_like(bg_img, shadow_color, dtype=np.float32)
-            bg_img = bg_img * (1 - shadow_alpha_3ch * shadow_opacity) + shadow_layer * shadow_alpha_3ch * shadow_opacity
-
-        # Blend foreground again
-        bg_roi = bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w]
-        fg_over_bg = blended_fg
-        bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] = (
-                bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] * (1 - alpha_3) +
-                fg_float[:, :, :3] * alpha_3
-        )
-        if center and not no_shadow:
-            # Darken under shadow
-            shadow_fg = shadow_alpha[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] * 0.25
-            darken_mask = (shadow_fg * alpha).astype(np.float32)
-            darken_mask_3ch = cv2.cvtColor(darken_mask, cv2.COLOR_GRAY2BGR)
-            darkness_strength = 0.8
-            fg_rgb = fg_float[:, :, :3]
-            fg_rgb_darkened = fg_rgb * (1 - darken_mask_3ch * darkness_strength)
-            fg_float[:, :, :3] = fg_rgb_darkened
-            fg_over_bg = bg_roi * (1 - alpha_3) + fg_float[:, :, :3] * alpha_3
-            bg_img[center_y:center_y + obj_new_h, center_x:center_x + obj_new_w] = fg_over_bg
-
-        final_img = bg_img.astype(np.uint8)
-
-        # Get relative path from ./images
-        rel_path = os.path.relpath(path, self.input_dir)
-
-        # Change extension to .webp
-        rel_path_no_ext = os.path.splitext(rel_path)[0]
-        output_file_path = os.path.join(self.output_dir, rel_path_no_ext + ".webp")
-
-        # Ensure output directory exists
-        output_dir = os.path.dirname(output_file_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-
-        print(output_file_path)
-
-        cv2.imwrite(output_file_path, final_img, [cv2.IMWRITE_WEBP_QUALITY, 95])
+        # Sauvegarder
+        base = os.path.basename(path)
+        name, _ = os.path.splitext(base)
+        out_path = os.path.join(self.output_dir, f"{name}.jpg")
+        cv2.imwrite(out_path, output, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
         return has_transparency
 
@@ -441,6 +365,10 @@ class MainWindow(QWidget):
         self.chk_ignore_case.setChecked(True)
         opts_row.addWidget(self.chk_ignore_case)
         opts_row.addItem(QSpacerItem(20, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        # Dans _build_ui, après la checkbox ignore_case, ajouter :
+        self.chk_use_rembg = QCheckBox("Utiliser rembg (IA) pour le détourage")
+        self.chk_use_rembg.setChecked(False)  # Par défaut: méthode classique
+        opts_row.addWidget(self.chk_use_rembg)
         root.addLayout(opts_row)
 
         # Table des règles: Mot-clé / Padding (%) / Centrer
@@ -484,6 +412,8 @@ class MainWindow(QWidget):
 
         # Ligne initiale d’exemple
         self._add_rule_row("FRONT", "10")
+        self._add_rule_row("FACE", "10")
+        self._add_rule_row("LEVIT", "10")
         self._add_rule_row("BACK", "10")
         self._add_rule_row("CAT", "15")
         self._add_rule_row("SIDE", "15")
@@ -572,7 +502,7 @@ class MainWindow(QWidget):
         self.progress_bar.setValue(0)
 
         self.thread = QThread(self)
-        self.worker = ImageProcessorWorker(input_dir, output_dir, rules, ignore_case,bg_files)
+        self.worker = ImageProcessorWorker(input_dir, output_dir, rules, ignore_case, bg_files,use_rembg=self.chk_use_rembg.isChecked())
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -608,7 +538,7 @@ class MainWindow(QWidget):
         self.output_edit.setEnabled(not busy)
         self.table.setEnabled(not busy)
         self.chk_ignore_case.setEnabled(not busy)
-
+        self.chk_use_rembg.setEnabled(not busy)
         # Curseur d’attente
         QApplication.setOverrideCursor(Qt.WaitCursor if busy else Qt.ArrowCursor)
 
